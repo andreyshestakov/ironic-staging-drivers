@@ -20,6 +20,7 @@ import os
 import shlex
 
 from ironic_lib import utils as irlib_utils
+from neutronclient.common import exceptions as neutron_exceptions
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log
@@ -40,6 +41,7 @@ from ironic.common.i18n import _LI
 from ironic.common.i18n import _LW
 from ironic.common import image_service
 from ironic.common import images
+from ironic.common import neutron
 from ironic.common import states
 from ironic.common import utils
 from ironic.conductor import rpcapi
@@ -206,6 +208,45 @@ def _get_node_ip(task):
     return ip_addrs[0]
 
 
+def _hack_instance_info_ip(task, ipv4_address=None):
+    instance_info = task.node.instance_info
+    if ipv4_address:
+        instance_info['ipv4_address'] = ipv4_address
+    else:
+        instance_info.pop('ipv4_address', None)
+    task.node.instance_info = instance_info
+    task.node.save()
+
+
+def _hack_port(task):
+    macs = [p.address for p in task.ports if p.pxe_enabled]
+    network_uuid = task.driver.network.get_provisioning_network_uuid()
+    params = {
+        'network_id': network_uuid,
+        'mac_address': macs,
+    }
+    client = neutron.get_client(task.context.auth_token)
+    try:
+        response = client.list_ports(**params)
+    except neutron_exceptions.NeutronClientException as e:
+        msg = (_('Could not get given network VIF for %(node)s '
+                 'from neutron, possible network issue. %(exc)s') %
+               {'node': node_uuid, 'exc': e})
+        LOG.exception(msg)
+        raise exception.NetworkError(msg)
+    ports = response.get('ports', [])
+    fixed_ips = []
+    for port in ports:
+        node_port = [p for p in task.ports if p.address == port.get('mac_address')][0]
+        extra = node_port.extra
+        extra['vif_port_id'] = port['id']
+        fixed_ips.extend(port['fixed_ips'])
+        node_port.extra = extra
+        node_port.save()
+    ips = [fip['ip_address'] for fip in fixed_ips]
+    _hack_instance_info_ip(task, ips[0])
+
+
 # some good code from agent
 def _reboot_and_finish_deploy(task):
     wait = CONF.ansible.post_deploy_get_power_state_retry_interval * 1000
@@ -229,7 +270,7 @@ def _reboot_and_finish_deploy(task):
                      'error': e})
         manager_utils.node_power_action(task, states.POWER_OFF)
 
-    task.driver.network.remove_provisioning_network(task)
+    _hack_port(task)
     task.driver.network.configure_tenant_networks(task)
     manager_utils.node_power_action(task, states.POWER_ON)
 
@@ -538,6 +579,7 @@ class AnsibleDeploy(base.DeployInterface):
     def tear_down(self, task):
         """Tear down a previous deployment on the task's node."""
         manager_utils.node_power_action(task, states.POWER_OFF)
+        _hack_instance_info_ip(task)
         task.driver.network.unconfigure_tenant_networks(task)
         return states.DELETED
 
